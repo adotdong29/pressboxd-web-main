@@ -1,104 +1,219 @@
 "use server";
 
+import { encodedRedirect } from "@/utils/utils";
 import { serverClient } from "@/utils/supabase/server";
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 
-// For our purposes, here's a simple encodedRedirect helper that logs and then redirects:
-export function encodedRedirect(status: "success" | "error", url: string, message: string) {
-  console.log(`Redirecting with status: ${status}, message: ${message}`);
-  return redirect(url);
-}
+export const signUpAction = async (formData: FormData) => {
+  const email = formData.get("email")?.toString();
+  const password = formData.get("password")?.toString();
+  const supabase = serverClient();
+  const origin = headers().get("origin");
 
-export const onboardingAction = async (formData: FormData) => {
-  console.log("Starting onboardingAction");
-
-  // Retrieve form values
-  const username = formData.get("username")?.toString();
-  const bio = formData.get("bio")?.toString();
-  // Retrieve the image file (if provided)
-  const imageFile = formData.get("image") as File | null;
-  console.log("Form data received:", { username, bio, imageFile });
-
-  if (!username || !bio) {
-    console.error("Missing username or bio");
-    return encodedRedirect("error", "/onboarding", "Username and bio are required");
+  if (!email || !password) {
+    return { error: "Email and password are required" };
   }
 
+  const { error } = await supabase.auth.signUp({
+    email,
+    password,
+    options: {
+      emailRedirectTo: `${origin}/auth/callback`,
+    },
+  });
+
+  if (error) {
+    console.error(error.code + " " + error.message);
+    return encodedRedirect("error", "/sign-up", error.message);
+  } else {
+    return encodedRedirect(
+      "success",
+      "/sign-up",
+      "Thanks for signing up! Please check your email for a verification link."
+    );
+  }
+};
+
+export const signInAction = async (formData: FormData) => {
+  const email = formData.get("email") as string;
+  const password = formData.get("password") as string;
   const supabase = serverClient();
 
-  // Debug: Log Supabase configuration (ensure the URL is correct)
-  console.log("Supabase URL from env:", process.env.NEXT_PUBLIC_SUPABASE_URL);
+  const { error } = await supabase.auth.signInWithPassword({
+    email,
+    password,
+  });
 
-  // Debug: List available buckets
-  const { data: buckets, error: bucketsError } = await supabase.storage.listBuckets();
-  console.log("Buckets available:", buckets, bucketsError);
-  const bucketNames = buckets?.map((b) => b.name) || [];
-  if (!bucketNames.includes("avatars")) {
-    console.error("Bucket 'avatars' not found in Supabase Storage");
-  } else {
-    console.log("Bucket 'avatars' found.");
+  if (error) {
+    return encodedRedirect("error", "/sign-in", error.message);
   }
 
-  // Retrieve the currently authenticated user
-  const { data: userData, error: getUserError } = await supabase.auth.getUser();
-  console.log("User data from getUser:", userData, getUserError);
-  const user = userData?.user;
-  if (!user) {
-    console.error("User not logged in");
-    return encodedRedirect("error", "/sign-in", "User not logged in");
-  }
-  console.log("Authenticated user:", user);
+  return redirect("/app");
+};
 
-  let imageUrl: string | null = null;
-
-  // If an image file is provided, upload it to the "avatars" bucket
-  if (imageFile && imageFile.size > 0) {
-    console.log("Image file detected:", imageFile);
-    const fileExt = imageFile.name.split('.').pop();
-    const fileName = `${user.id}.${fileExt}`;
-    const filePath = fileName; // Optionally, you can organize files in subfolders
-
-    // The following line uploads the image file to the "avatars" bucket:
-    const { error: uploadError } = await supabase.storage
-      .from("avatars")
-      .upload(filePath, imageFile);
-    console.log("Image upload response:", uploadError);
-
-    if (uploadError) {
-      console.error("Image upload error:", uploadError);
-      return encodedRedirect("error", "/onboarding", uploadError.message);
+export const onboardingAction = async (formData: FormData) => {
+  try {
+    const supabase = serverClient();
+    const username = formData.get("username") as string;
+    const bio = formData.get("bio") as string;
+    const image = formData.get("image") as string;
+    
+    if (!username || !bio) {
+      return encodedRedirect("error", "/app/onboarding", "Username and bio are required");
+    }
+    
+    // Check if user exists
+    const { data: { user } } = await supabase.auth.getUser();
+    
+    if (!user) {
+      return redirect("/sign-in");
     }
 
-    // Retrieve the public URL for the uploaded image
-    const { data: publicUrlData } = supabase.storage
-      .from("avatars")
-      .getPublicUrl(filePath);
-    console.log("Public URL data:", publicUrlData);
-    imageUrl = publicUrlData.publicUrl;
+    console.log("User authenticated:", user.id);
+
+    // Check if username already exists
+    const { data: existingUser } = await supabase
+      .from("users")
+      .select("username")
+      .eq("username", username)
+      .maybeSingle();
+
+    if (existingUser) {
+      return encodedRedirect("error", "/app/onboarding", "Username is already taken");
+    }
+    
+    let profileImageUrl = null;
+
+    // Only try to upload if an image was provided
+    if (image && image !== "") {
+      try {
+        // Create a unique filename based on user ID and timestamp
+        const filename = `${user.id}_${Date.now()}`;
+        
+        console.log("Attempting to upload image to avatars bucket with filename:", filename);
+        
+        const { data, error } = await supabase.storage
+          .from("avatars")
+          .upload(filename, image, {
+            upsert: true
+          });
+
+        if (error) {
+          console.error("Storage error:", error);
+        } else {
+          console.log("Image uploaded successfully");
+          
+          // Get the public URL
+          const { data: publicUrlData } = supabase.storage
+            .from("avatars")
+            .getPublicUrl(filename);
+          
+          profileImageUrl = publicUrlData?.publicUrl || null;
+          console.log("Profile image URL:", profileImageUrl);
+        }
+      } catch (err) {
+        console.error("Upload error:", err);
+      }
+    }
+    
+    console.log("Creating user profile with data:", {
+      id: user.id,
+      username,
+      bio,
+      profile_url: profileImageUrl,
+      onboarded: true
+    });
+    
+    // Insert user profile
+    const { error: profileError } = await supabase
+      .from("users")
+      .insert({
+        id: user.id,
+        username,
+        bio,
+        profile_url: profileImageUrl,
+        onboarded: true
+      });
+
+    if (profileError) {
+      console.error("Profile error:", profileError);
+      return encodedRedirect("error", "/app/onboarding", profileError.message);
+    }
+
+    console.log("User profile created successfully");
+    return redirect("/app");
+  } catch (err) {
+    console.error("Onboarding error:", err);
+    return encodedRedirect("error", "/app/onboarding", "An unexpected error occurred");
+  }
+};
+
+export const forgotPasswordAction = async (formData: FormData) => {
+  const email = formData.get("email")?.toString();
+  const supabase = serverClient();
+  const origin = headers().get("origin");
+  const callbackUrl = formData.get("callbackUrl")?.toString();
+
+  if (!email) {
+    return encodedRedirect("error", "/forgot-password", "Email is required");
   }
 
-  // Prepare profile data for upsert (insert or update)
-  const profileData = {
-    id: user.id,
-    username,
-    bio,
-    onboarded: true,
-    image: imageUrl,
-  };
-  console.log("Profile data to upsert:", profileData);
+  const { error } = await supabase.auth.resetPasswordForEmail(email, {
+    redirectTo: `${origin}/auth/callback?redirect_to=/app/reset-password`,
+  });
 
-  // Upsert the profile data in the "users" table
-  const { error: upsertError, data: upsertData } = await supabase
-    .from("users")
-    .upsert(profileData, { onConflict: "id" });
-  console.log("Upsert result:", upsertError, upsertData);
-
-  if (upsertError) {
-    console.error("Onboarding upsert error:", upsertError);
-    return encodedRedirect("error", "/onboarding", upsertError.message);
+  if (error) {
+    console.error(error.message);
+    return encodedRedirect(
+      "error",
+      "/forgot-password",
+      "Could not reset password"
+    );
   }
 
-  console.log("Onboarding upsert successful. Redirecting to /app");
-  return encodedRedirect("success", "/app", "Onboarding complete!");
+  if (callbackUrl) {
+    return redirect(callbackUrl);
+  }
+
+  return encodedRedirect(
+    "success",
+    "/forgot-password",
+    "Check your email for a link to reset your password."
+  );
+};
+
+export const resetPasswordAction = async (formData: FormData) => {
+  const supabase = serverClient();
+
+  const password = formData.get("password") as string;
+  const confirmPassword = formData.get("confirmPassword") as string;
+
+  if (!password || !confirmPassword) {
+    return encodedRedirect(
+      "error",
+      "/app/reset-password",
+      "Password and confirm password are required"
+    );
+  }
+
+  if (password !== confirmPassword) {
+    return encodedRedirect("error", "/app/reset-password", "Passwords do not match");
+  }
+
+  const { error } = await supabase.auth.updateUser({
+    password: password,
+  });
+
+  if (error) {
+    return encodedRedirect("error", "/app/reset-password", "Password update failed");
+  }
+
+  return encodedRedirect("success", "/app/reset-password", "Password updated");
+};
+
+export const signOutAction = async () => {
+  const supabase = serverClient();
+  await supabase.auth.signOut();
+  return redirect("/sign-in");
 };
